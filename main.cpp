@@ -6,6 +6,12 @@
 #include <unistd.h>
 #include <fstream>
 #include <thread>
+#include <windows.h>
+#include <string>
+#include <sstream>
+#include <iostream>
+#include <stdexcept>
+#include <fcntl.h>
 struct processing_list_item {
     std::filesystem::path path;
     std::string status;
@@ -13,15 +19,99 @@ struct processing_list_item {
 // thread safe processing list
 std::mutex processing_list_mutex;
 std::map<std::filesystem::path, std::string> processing_list;
+class Process {
+public:
+    HANDLE hProcess = NULL;
+    HANDLE hStdOut = NULL;
+    HANDLE hStdErr = NULL;
 
-void popen_print(FILE* stream) {
+    Process(HANDLE processHandle, HANDLE stdoutHandle, HANDLE stderrHandle)
+            : hProcess(processHandle), hStdOut(stdoutHandle), hStdErr(stderrHandle) {}
+
+    ~Process() {
+        if (hStdOut != NULL) CloseHandle(hStdOut);
+        if (hStdErr != NULL) CloseHandle(hStdErr);
+        if (hProcess != NULL) CloseHandle(hProcess);
+    }
+};
+void print_output(HANDLE hRead) {
+
     char buffer[256];
-    while (!feof(stream)) {
-        if (fgets(buffer, 256, stream) != NULL) {
-            SDL_Log("ffmpeg output: %s", buffer);
-        }
+    DWORD bytesRead;
+    while (ReadFile(hRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        buffer[bytesRead] = '\0';
+        SDL_Log("%s", buffer);
     }
 
+}
+
+std::string read_output(HANDLE hRead) {
+    std::ostringstream output;
+    char buffer[256];
+    DWORD bytesRead;
+    while (ReadFile(hRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        buffer[bytesRead] = '\0';
+        output << buffer;
+    }
+    return output.str();
+}
+
+
+
+Process popen_no_window(const std::string& command) {
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    HANDLE stdoutRead, stdoutWrite, stderrRead, stderrWrite;
+
+    // Create pipes for stdout
+    if (!CreatePipe(&stdoutRead, &stdoutWrite, &sa, 0)) {
+        throw std::runtime_error("Failed to create stdout pipe");
+    }
+    if (!SetHandleInformation(stdoutRead, HANDLE_FLAG_INHERIT, 0)) {
+        CloseHandle(stdoutRead);
+        CloseHandle(stdoutWrite);
+        throw std::runtime_error("Failed to set stdout handle information");
+    }
+
+    // Create pipes for stderr
+    if (!CreatePipe(&stderrRead, &stderrWrite, &sa, 0)) {
+        CloseHandle(stdoutRead);
+        CloseHandle(stdoutWrite);
+        throw std::runtime_error("Failed to create stderr pipe");
+    }
+    if (!SetHandleInformation(stderrRead, HANDLE_FLAG_INHERIT, 0)) {
+        CloseHandle(stdoutRead);
+        CloseHandle(stdoutWrite);
+        CloseHandle(stderrRead);
+        CloseHandle(stderrWrite);
+        throw std::runtime_error("Failed to set stderr handle information");
+    }
+
+    STARTUPINFO si = { sizeof(STARTUPINFO) };
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.hStdInput = NULL;
+    si.hStdOutput = stdoutWrite;
+    si.hStdError = stderrWrite;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = {};
+    std::string cmd = "cmd.exe /C " + command; // Wrap command in cmd.exe
+    if (!CreateProcess(NULL, const_cast<char*>(cmd.c_str()), NULL, NULL, TRUE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(stdoutRead);
+        CloseHandle(stdoutWrite);
+        CloseHandle(stderrRead);
+        CloseHandle(stderrWrite);
+        throw std::runtime_error("Failed to create process");
+    }
+
+    CloseHandle(stdoutWrite); // Close write ends in the parent
+    CloseHandle(stderrWrite);
+
+    return Process(pi.hProcess, stdoutRead, stderrRead);
 }
 bool extend_video(const std::filesystem::path& path) {
     {
@@ -29,104 +119,103 @@ bool extend_video(const std::filesystem::path& path) {
         processing_list[path] = "Reading";
     }
 // ffprobe that video
-    auto cmd  = "ffprobe.exe -i \"" + path.string() + "\" -show_format -show_streams -of json";
+    auto cmd = "ffprobe.exe -i \"" + path.string() + "\" -show_format -show_streams -of json";
 
-    FILE* stream;
-    stream = popen(cmd.c_str(), "r");
-    if (stream) {
-        std::string probe;
-        char buffer[256];
-        while (!feof(stream)) {
-            if (fgets(buffer, 256, stream) != NULL) {
-                SDL_Log("ffmpeg probe: %s", buffer);
-                probe += buffer;
-            }
-        }
-        int exit_status = pclose(stream);
-        if (exit_status != 0) {
-            SDL_Log("Error: %s", strerror(exit_status));
-            return false;
-        }
-        // check exit status
-        SDL_Log("Output: %s", probe.c_str());
-        auto j = nlohmann::json::parse(probe);
-        // get first stream
-        auto stream = j["streams"][0];
-        auto ext = path.extension().string();
-        auto video_duration = std::stod(stream["duration"].get<std::string>().c_str());
-        auto duration = 181 - video_duration;
-        if(duration < 0) {
-            SDL_Log("Video is already 3 minutes or longer");
-            return false;
-        }
-        if (!stream.contains("width") || !stream.contains("height") || !stream.contains("r_frame_rate")) {
-            SDL_Log("Video is not supported");
-            return false;
-        }
-        auto width = stream["width"].get<int>();
-        auto height = stream["height"].get<int>();
-        auto r_frame_rate = stream["r_frame_rate"].get<std::string>().c_str();
-        // split r_frame_rate with '/'
-        std::vector<std::string> parts;
-        std::stringstream ss(r_frame_rate);
-        std::string item;
-        while (std::getline(ss, item, '/')) {
-            parts.push_back(item);
-        }
-        auto frame_rate = std::stod(parts[0].c_str()) / std::stod(parts[1].c_str());
-        auto time_base = stream["time_base"].get<std::string>().c_str();
-        // hash input file path
-        auto hash = std::hash<std::string>{}(path.string());
-        // make a black screen video which matches the format of the input video, to fill 3 minutes.
-        {
-            std::lock_guard<std::mutex> lock(processing_list_mutex);
-            processing_list[path] = "Creating black video";
-        }
-        auto black_video = ".\\temp\\" + std::to_string(hash) + "_black.mp4";
-        if (std::filesystem::exists(black_video)) {
-            std::filesystem::remove(black_video);
-        }
+    auto ffprobe = popen_no_window(cmd.c_str());
 
-        auto ffmpegCmd = "ffmpeg.exe -f lavfi -i color=c=black:s=" + std::to_string(width) + "x" + std::to_string(height) + ":r=" + std::to_string(frame_rate) + ":d=" + std::to_string(duration) + " -vcodec " + stream["codec_name"].get<std::string>() + " -pix_fmt " + stream["pix_fmt"].get<std::string>() + " -b:v " + stream["bit_rate"].get<std::string>() + " -time_base " + time_base + " -y \"" + black_video + "\" 2>&1";
-        SDL_Log("ffmpeg command: %s", ffmpegCmd.c_str());
-        auto ffmpeg = popen(ffmpegCmd.c_str(), "r");
-        if (ffmpeg) {
-            popen_print(ffmpeg);
-            int exit_status = pclose(ffmpeg);
-            if (exit_status != 0) {
-                SDL_Log("Error: %s", strerror(exit_status));
-                return false;
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(processing_list_mutex);
-            processing_list[path] = "Concatenating";
-        }
-
-        auto concat_list = ".\\temp\\" + std::to_string(hash) + "_concat_list.txt";
-        // write concat list
-        std::ofstream concat_list_file(concat_list);
-        concat_list_file << "file '" << path.string() << "'\n";
-        concat_list_file << "file '" << std::to_string(hash) + "_black.mp4" << "'\n";
-        concat_list_file.close();
-        auto output = path.parent_path().string() + "\\" + path.stem().string() + "_extended.mp4";
-        // remove if exists
-        if (std::filesystem::exists(output)) {
-            std::filesystem::remove(output);
-        }
-        auto concatCmd = "ffmpeg.exe -safe 0 -f concat -i \"" + concat_list + "\" -c copy \"" + output + "\" 2>&1";
-        SDL_Log("concat command: %s", concatCmd.c_str());
-        auto concat = popen(concatCmd.c_str(), "r");
-        if (concat) {
-            popen_print(concat);
-            int exit_status = pclose(concat);
-            if (exit_status != 0) {
-                SDL_Log("Error: %s", strerror(exit_status));
-                return false;
-            }
-        }
+    std::string probe = read_output(ffprobe.hStdOut);
+    DWORD exit_status;
+    GetExitCodeProcess(ffprobe.hProcess, &exit_status);
+    if (exit_status != 0) {
+        return false;
     }
+    // check exit status
+    SDL_Log("Output: %s", probe.c_str());
+    auto j = nlohmann::json::parse(probe);
+    // get first stream
+    auto stream = j["streams"][0];
+    auto ext = path.extension().string();
+    auto video_duration = std::stod(stream["duration"].get<std::string>().c_str());
+    auto duration = 181 - video_duration;
+    if (duration < 0) {
+        SDL_Log("Video is already 3 minutes or longer");
+        return false;
+    }
+    if (!stream.contains("width") || !stream.contains("height") || !stream.contains("r_frame_rate")) {
+        SDL_Log("Video is not supported");
+        return false;
+    }
+    auto width = stream["width"].get<int>();
+    auto height = stream["height"].get<int>();
+    auto r_frame_rate = stream["r_frame_rate"].get<std::string>().c_str();
+    SDL_Log("r_frame_rate: %s", r_frame_rate);
+    // split r_frame_rate with '/'
+    std::vector<std::string> parts;
+    std::stringstream ss(r_frame_rate);
+    std::string item;
+    while (std::getline(ss, item, '/')) {
+        parts.push_back(item);
+    }
+    auto frame_rate = std::stod(parts[0].c_str()) / std::stod(parts[1].c_str());
+    auto time_base = stream["time_base"].get<std::string>();
+    SDL_Log("time_base: %s", time_base.c_str());
+    // hash input file path
+    auto hash = std::hash<std::string>{}(path.string());
+    // make a black screen video which matches the format of the input video, to fill 3 minutes.
+    {
+        std::lock_guard<std::mutex> lock(processing_list_mutex);
+        processing_list[path] = "Creating black video";
+    }
+    auto black_video = ".\\temp\\" + std::to_string(hash) + "_black.mp4";
+    if (std::filesystem::exists(black_video)) {
+        std::filesystem::remove(black_video);
+    }
+
+    auto ffmpegCmd =
+            "ffmpeg.exe -f lavfi -i color=c=black:s=" + std::to_string(width) + "x" + std::to_string(height) + ":r=" +
+            std::to_string(frame_rate) + ":d=" + std::to_string(duration) + " -vcodec " +
+            stream["codec_name"].get<std::string>() + " -pix_fmt " + stream["pix_fmt"].get<std::string>() + " -b:v " +
+            stream["bit_rate"].get<std::string>() + " -time_base " + time_base + " -y \"" + black_video + "\" 2>&1";
+    SDL_Log("ffmpeg command: %s", ffmpegCmd.c_str());
+    auto ffmpeg = popen_no_window(ffmpegCmd.c_str());
+
+    print_output(ffmpeg.hStdOut);
+    DWORD ffmpeg_exit_status;
+    GetExitCodeProcess(ffmpeg.hProcess, &ffmpeg_exit_status);
+    if (ffmpeg_exit_status != 0) {
+        return false;
+    }
+
+
+    {
+        std::lock_guard<std::mutex> lock(processing_list_mutex);
+        processing_list[path] = "Concatenating";
+    }
+
+    auto concat_list = ".\\temp\\" + std::to_string(hash) + "_concat_list.txt";
+    // write concat list
+    std::ofstream concat_list_file(concat_list);
+    concat_list_file << "file '" << path.string() << "'\n";
+    concat_list_file << "file '" << std::to_string(hash) + "_black.mp4" << "'\n";
+    concat_list_file.close();
+    auto output = path.parent_path().string() + "\\" + path.stem().string() + "_extended.mp4";
+    // remove if exists
+    if (std::filesystem::exists(output)) {
+        std::filesystem::remove(output);
+    }
+    auto concatCmd = "ffmpeg.exe -safe 0 -f concat -i \"" + concat_list + "\" -c copy \"" + output + "\" 2>&1";
+    SDL_Log("concat command: %s", concatCmd.c_str());
+    auto concat = popen_no_window(concatCmd.c_str());
+
+    print_output(concat.hStdOut);
+    DWORD concat_exit_status;
+    GetExitCodeProcess(concat.hProcess, &concat_exit_status);
+    if (concat_exit_status != 0) {
+        return false;
+    }
+
+
+
     return true;
 
 }
