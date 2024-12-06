@@ -29,7 +29,7 @@ bool extend_video(const std::filesystem::path& path) {
         processing_list[path] = "Reading";
     }
 // ffprobe that video
-    auto cmd  = ".\\bin\\ffprobe.exe -i \"" + path.string() + "\" -show_format -show_streams -of json";
+    auto cmd  = "ffprobe.exe -i \"" + path.string() + "\" -show_format -show_streams -of json";
 
     FILE* stream;
     stream = popen(cmd.c_str(), "r");
@@ -82,12 +82,12 @@ bool extend_video(const std::filesystem::path& path) {
             std::lock_guard<std::mutex> lock(processing_list_mutex);
             processing_list[path] = "Creating black video";
         }
-        auto black_video = ".\\assets\\" + std::to_string(hash) + "_black.mp4";
+        auto black_video = ".\\temp\\" + std::to_string(hash) + "_black.mp4";
         if (std::filesystem::exists(black_video)) {
             std::filesystem::remove(black_video);
         }
 
-        auto ffmpegCmd = ".\\bin\\ffmpeg.exe -f lavfi -i color=c=black:s=" + std::to_string(width) + "x" + std::to_string(height) + ":r=" + std::to_string(frame_rate) + ":d=" + std::to_string(duration) + " -vcodec " + stream["codec_name"].get<std::string>() + " -pix_fmt " + stream["pix_fmt"].get<std::string>() + " -b:v " + stream["bit_rate"].get<std::string>() + " -time_base " + time_base + " -y \"" + black_video + "\" 2>&1";
+        auto ffmpegCmd = "ffmpeg.exe -f lavfi -i color=c=black:s=" + std::to_string(width) + "x" + std::to_string(height) + ":r=" + std::to_string(frame_rate) + ":d=" + std::to_string(duration) + " -vcodec " + stream["codec_name"].get<std::string>() + " -pix_fmt " + stream["pix_fmt"].get<std::string>() + " -b:v " + stream["bit_rate"].get<std::string>() + " -time_base " + time_base + " -y \"" + black_video + "\" 2>&1";
         SDL_Log("ffmpeg command: %s", ffmpegCmd.c_str());
         auto ffmpeg = popen(ffmpegCmd.c_str(), "r");
         if (ffmpeg) {
@@ -104,7 +104,7 @@ bool extend_video(const std::filesystem::path& path) {
             processing_list[path] = "Concatenating";
         }
 
-        auto concat_list = ".\\assets\\" + std::to_string(hash) + "_concat_list.txt";
+        auto concat_list = ".\\temp\\" + std::to_string(hash) + "_concat_list.txt";
         // write concat list
         std::ofstream concat_list_file(concat_list);
         concat_list_file << "file '" << path.string() << "'\n";
@@ -115,7 +115,7 @@ bool extend_video(const std::filesystem::path& path) {
         if (std::filesystem::exists(output)) {
             std::filesystem::remove(output);
         }
-        auto concatCmd = ".\\bin\\ffmpeg.exe -safe 0 -f concat -i \"" + concat_list + "\" -c copy \"" + output + "\" 2>&1";
+        auto concatCmd = "ffmpeg.exe -safe 0 -f concat -i \"" + concat_list + "\" -c copy \"" + output + "\" 2>&1";
         SDL_Log("concat command: %s", concatCmd.c_str());
         auto concat = popen(concatCmd.c_str(), "r");
         if (concat) {
@@ -132,7 +132,12 @@ bool extend_video(const std::filesystem::path& path) {
 }
 
 int main(int argc, char *argv[]) {
-
+    // mkdir temp
+    std::filesystem::create_directory(".\\temp\\");
+    // set PATH env
+    std::string path = (std::filesystem::current_path() / "bin").string();
+    SDL_Log("PATH: %s", path.c_str());
+    _putenv_s("PATH", path.c_str());
     SDL_Init(SDL_INIT_EVERYTHING);
     SDL_Log("Hello World!");
     SDL_Window *window = SDL_CreateWindow("deshortify", 100, 100, 640, 480, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
@@ -214,6 +219,10 @@ int main(int argc, char *argv[]) {
             SDL_RenderCopy(renderer, texture, &srcRect, &dstRect);
             SDL_FreeSurface(textSurface);
             SDL_DestroyTexture(texture);
+        }
+        if(quit){
+            SDL_SetWindowTitle(window, "Cleaning up");
+            std::filesystem::remove_all(".\\temp\\");
         }
         SDL_RenderPresent(renderer);
     }
