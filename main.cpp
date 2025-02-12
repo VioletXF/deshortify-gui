@@ -19,6 +19,30 @@ struct processing_list_item {
 // thread safe processing list
 std::mutex processing_list_mutex;
 std::map<std::filesystem::path, std::string> processing_list;
+
+std::string path_t_to_utf8(const std::wstring &input) {
+
+    // Determine the size of the buffer needed
+    int requiredSize = WideCharToMultiByte(65001 /* UTF8 */, 0, input.c_str(), -1,
+                                           NULL, 0, NULL, NULL);
+
+    if (requiredSize <= 0) {
+        // Conversion failed, return an empty string
+        return std::string();
+    }
+
+    // Create a string with the required size
+    std::string result(requiredSize, '\0');
+
+    // Perform the conversion
+    WideCharToMultiByte(65001 /* UTF8 */, 0, input.c_str(), -1, &result[0],
+                        requiredSize, NULL, NULL);
+
+    // Remove the extra null terminator added by WideCharToMultiByte
+    result.resize(requiredSize - 1);
+
+    return result;
+}
 class Process {
 public:
     HANDLE hProcess = NULL;
@@ -58,7 +82,7 @@ std::string read_output(HANDLE hRead) {
 
 
 
-Process popen_no_window(const std::string& command) {
+Process popen_no_window(const std::wstring& command) {
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
@@ -90,7 +114,7 @@ Process popen_no_window(const std::string& command) {
         throw std::runtime_error("Failed to set stderr handle information");
     }
 
-    STARTUPINFO si = { sizeof(STARTUPINFO) };
+    STARTUPINFOW si = { sizeof(STARTUPINFO) };
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.hStdInput = NULL;
     si.hStdOutput = stdoutWrite;
@@ -98,8 +122,8 @@ Process popen_no_window(const std::string& command) {
     si.wShowWindow = SW_HIDE;
 
     PROCESS_INFORMATION pi = {};
-    std::string cmd = "cmd.exe /C " + command; // Wrap command in cmd.exe
-    if (!CreateProcess(NULL, const_cast<char*>(cmd.c_str()), NULL, NULL, TRUE,
+    std::wstring cmd = L"cmd.exe /C " + command; // Wrap command in cmd.exe
+    if (!CreateProcessW(NULL, cmd.data(), NULL, NULL, TRUE,
                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         CloseHandle(stdoutRead);
         CloseHandle(stdoutWrite);
@@ -118,15 +142,18 @@ bool extend_video(const std::filesystem::path& path) {
         std::lock_guard<std::mutex> lock(processing_list_mutex);
         processing_list[path] = "Reading";
     }
+    // normalize path wide char (windows WideCharToMultiByte)
+    // std::string utf8_path = path_t_to_utf8(path.wstring());
 // ffprobe that video
-    auto cmd = "ffprobe.exe -i \"" + path.string() + "\" -show_format -show_streams -of json";
-
+    auto cmd = L"ffprobe.exe -i \"" + path.wstring() + L"\" -show_format -show_streams -of json";
+// std::cout << cmd << std::endl;
     auto ffprobe = popen_no_window(cmd.c_str());
 
     std::string probe = read_output(ffprobe.hStdOut);
     DWORD exit_status;
     GetExitCodeProcess(ffprobe.hProcess, &exit_status);
     if (exit_status != 0) {
+        std::cerr << "Error: ffprobe exited with status " << exit_status << std::endl;
         return false;
     }
     // check exit status
@@ -134,8 +161,10 @@ bool extend_video(const std::filesystem::path& path) {
     auto j = nlohmann::json::parse(probe);
     // get first stream
     auto stream = j["streams"][0];
+    auto format = j["format"];
+    auto w_ext = path.extension().wstring();
     auto ext = path.extension().string();
-    auto video_duration = std::stod(stream["duration"].get<std::string>().c_str());
+    auto video_duration = std::stod(format["duration"].get<std::string>().c_str());
     auto duration = 181 - video_duration;
     if (duration < 0) {
         SDL_Log("Video is already 3 minutes or longer");
@@ -157,7 +186,9 @@ bool extend_video(const std::filesystem::path& path) {
         parts.push_back(item);
     }
     auto frame_rate = std::stod(parts[0].c_str()) / std::stod(parts[1].c_str());
-    auto time_base = stream["time_base"].get<std::string>();
+    auto _time_base = stream["time_base"].get<std::string>();
+    std::wstring time_base;
+    time_base.assign(_time_base.begin(), _time_base.end());
     SDL_Log("time_base: %s", time_base.c_str());
     // hash input file path
     auto hash = std::hash<std::string>{}(path.string());
@@ -166,18 +197,27 @@ bool extend_video(const std::filesystem::path& path) {
         std::lock_guard<std::mutex> lock(processing_list_mutex);
         processing_list[path] = "Creating black video";
     }
-    auto black_video = ".\\temp\\" + std::to_string(hash) + "_black.mp4";
+    auto black_video = L".\\temp\\" + std::to_wstring(hash) + L"_black" + w_ext;
     if (std::filesystem::exists(black_video)) {
         std::filesystem::remove(black_video);
     }
 
+    std::string _codec_name = stream["codec_name"].get<std::string>();
+    std::wstring codec_name;
+    codec_name.assign(_codec_name.begin(), _codec_name.end());
+    auto _pix_fmt = stream["pix_fmt"].get<std::string>();
+    std::wstring pix_fmt;
+    pix_fmt.assign(_pix_fmt.begin(), _pix_fmt.end());
+    auto _bit_rate = format["bit_rate"].get<std::string>();
+    std::wstring bit_rate;
+    bit_rate.assign(_bit_rate.begin(), _bit_rate.end());
+
     auto ffmpegCmd =
-            "ffmpeg.exe -f lavfi -i color=c=black:s=" + std::to_string(width) + "x" + std::to_string(height) + ":r=" +
-            std::to_string(frame_rate) + ":d=" + std::to_string(duration) + " -vcodec " +
-            stream["codec_name"].get<std::string>() + " -pix_fmt " + stream["pix_fmt"].get<std::string>() + " -b:v " +
-            stream["bit_rate"].get<std::string>() + " -time_base " + time_base + " -y \"" + black_video + "\" 2>&1";
-    SDL_Log("ffmpeg command: %s", ffmpegCmd.c_str());
-    auto ffmpeg = popen_no_window(ffmpegCmd.c_str());
+            L"ffmpeg.exe -f lavfi -i color=c=black:s=" + std::to_wstring(width) + L"x" + std::to_wstring(height) + L":r=" +
+            std::to_wstring(frame_rate) + L":d=" + std::to_wstring(duration) + L" -vcodec " +
+            codec_name + L" -preset ultrafast -pix_fmt " + pix_fmt + L" -time_base " + time_base + L" -y \"" + black_video + L"\" 2>&1";
+    SDL_Log("ffmpeg command: %s", path_t_to_utf8(ffmpegCmd).c_str());
+    auto ffmpeg = popen_no_window(ffmpegCmd);
 
     print_output(ffmpeg.hStdOut);
     DWORD ffmpeg_exit_status;
@@ -192,18 +232,18 @@ bool extend_video(const std::filesystem::path& path) {
         processing_list[path] = "Concatenating";
     }
 
-    auto concat_list = ".\\temp\\" + std::to_string(hash) + "_concat_list.txt";
+    auto concat_list = L".\\temp\\" + std::to_wstring(hash) + L"_concat_list.txt";
     // write concat list
-    std::ofstream concat_list_file(concat_list);
-    concat_list_file << "file '" << path.string() << "'\n";
-    concat_list_file << "file '" << std::to_string(hash) + "_black.mp4" << "'\n";
+    std::ofstream concat_list_file((concat_list.data()));
+    concat_list_file << "file '" << path_t_to_utf8(path) << "'\n";
+    concat_list_file << "file '" << std::to_string(hash) + "_black" + ext << "'\n";
     concat_list_file.close();
-    auto output = path.parent_path().string() + "\\" + path.stem().string() + "_extended.mp4";
+    auto output = path.parent_path().wstring() + L"\\" + path.stem().wstring() + L"_extended" + w_ext;
     // remove if exists
     if (std::filesystem::exists(output)) {
         std::filesystem::remove(output);
     }
-    auto concatCmd = "ffmpeg.exe -safe 0 -f concat -i \"" + concat_list + "\" -c copy \"" + output + "\" 2>&1";
+    auto concatCmd = L"ffmpeg.exe -safe 0 -f concat -i \"" + concat_list + L"\" -c copy \"" + output + L"\" 2>&1";
     SDL_Log("concat command: %s", concatCmd.c_str());
     auto concat = popen_no_window(concatCmd.c_str());
 
