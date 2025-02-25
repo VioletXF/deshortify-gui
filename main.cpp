@@ -165,7 +165,7 @@ bool extend_video(const std::filesystem::path& path) {
     auto w_ext = path.extension().wstring();
     auto ext = path.extension().string();
     auto video_duration = std::stod(format["duration"].get<std::string>().c_str());
-    auto duration = 181 - video_duration;
+    auto duration = 182 - video_duration;
     if (duration < 0) {
         SDL_Log("Video is already 3 minutes or longer");
         return false;
@@ -205,9 +205,15 @@ bool extend_video(const std::filesystem::path& path) {
     std::string _codec_name = stream["codec_name"].get<std::string>();
     std::wstring codec_name;
     codec_name.assign(_codec_name.begin(), _codec_name.end());
-    auto _pix_fmt = stream["pix_fmt"].get<std::string>();
+
     std::wstring pix_fmt;
-    pix_fmt.assign(_pix_fmt.begin(), _pix_fmt.end());
+    if (stream.contains("pix_fmt")) {
+        auto _pix_fmt = stream["pix_fmt"].get<std::string>();
+        pix_fmt.assign(_pix_fmt.begin(), _pix_fmt.end());
+    } else {
+        // Default to yuv420p if pix_fmt is not available
+        pix_fmt = L"yuv420p";
+    }
     auto _bit_rate = format["bit_rate"].get<std::string>();
     std::wstring bit_rate;
     bit_rate.assign(_bit_rate.begin(), _bit_rate.end());
